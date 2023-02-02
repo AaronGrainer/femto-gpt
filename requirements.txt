@@ -1,0 +1,6 @@
+pre-commit==3.0.1
+black==22.10.0
+flake8==6.0.0
+isort==5.10.1
+typer==0.7.0
+torch==1.13.0

@@ -177,7 +177,7 @@ class BigramLanguageModel(nn.Module):
 
 
 @app.command()
-def train_bigram():
+def train():
     # Prepare dataset
     data = torch.tensor(encode(input_text), dtype=torch.long)
     n = int(len(data) * config.TRAIN_TEST_SPLIT)
