@@ -63,15 +63,87 @@ def estimate_loss(train_text, test_text, model):
     model.train()
 
 
+class FeedForwardLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.fc1 = nn.Sequential(
+            nn.Linear(config.CHANNEL_SIZE, config.N_EMBED),
+            nn.ReLU(),
+            nn.Linear(config.N_EMBED, config.CHANNEL_SIZE),
+            nn.Dropout(config.DROPOUT)
+        )
+
+    def forward(self, x):
+        return self.fc1(x)
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.layer_norm = nn.LayerNorm(config.CHANNEL_SIZE)
+        self.attention = MultiHeadAttention()
+
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = x + self.attention(x)
+
+        return x
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.heads = nn.ModuleList([Attention() for _ in range(config.HEADS)])
+
+    def forward(self, x):
+        heads = [head(x) for head in self.heads]
+        heads = torch.stack(heads, dim=1)
+
+        return heads
+
+
+class Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.key = nn.Linear(config.CHANNEL_SIZE, config.HEAD_SIZE, bias=False)
+        self.query = nn.Linear(config.CHANNEL_SIZE, config.HEAD_SIZE, bias=False)
+        self.value = nn.Linear(config.CHANNEL_SIZE, config.HEAD_SIZE, bias=False)
+
+    def forward(self, x):
+        k = self.key(x)
+        q = self.query(x)
+
+        wei = q @ k.transpose(-2, -1) / (config.HEAD_SIZE ** 0.5)
+
+        tril = torch.tril(torch.ones((config.BLOCK_SIZE, config.BLOCK_SIZE), dtype=torch.long))
+        wei = wei.masked_fill(tril == 0, float("-inf"))
+        wei = F.softmax(wei, dim=-1)
+        
+        v = self.value(x)
+        bow = wei @ v
+
+        return bow
+
+
 class BigramModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.embedding = nn.Embedding(len(tokens), config.N_EMBED)
+        self.token_embed = nn.Embedding(len(tokens), config.N_EMBED)
+        self.pos_embed = nn.Embedding(config.BLOCK_SIZE, config.N_EMBED)
+        self.blocks = nn.Sequential(*[Block() for _ in range(config.N_LAYER)])
+        self.layer_norm = nn.LayerNorm(config.N_EMBED)
         self.lm_head = nn.Linear(config.N_EMBED, len(tokens))
 
     def forward(self, x, target=None):
-        logits = self.embedding(x)
+        logits = self.token_embed(x)
+        logits += self.pos_embed(torch.arange(config.BLOCK_SIZE))
+        logits = self.blocks(logits)
+        logits = self.layer_norm(logits)
         logits = self.lm_head(logits)
 
         if target is None:
@@ -102,29 +174,56 @@ def main():
     # Initialize model
     model = BigramModel()
 
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+    # # Initialize optimizer
+    # optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
 
-    split = int(len(text) * config.TRAIN_TEST_SPLIT)
-    train_text = torch.tensor(encoder(text[:split]), dtype=torch.long)
-    test_text = torch.tensor(encoder(text[split:]), dtype=torch.long)
+    # split = int(len(text) * config.TRAIN_TEST_SPLIT)
+    # train_text = torch.tensor(encoder(text[:split]), dtype=torch.long)
+    # test_text = torch.tensor(encoder(text[split:]), dtype=torch.long)
 
-    start_idx = torch.zeros((1, 1), dtype=torch.long)    
+    # start_idx = torch.zeros((1, 1), dtype=torch.long)    
 
-    for epoch in tqdm(range(config.EPOCHS)):
-        x, y = get_batch(train_text)
+    # for epoch in tqdm(range(config.EPOCHS)):
+    #     x, y = get_batch(train_text)
 
-        logits, loss = model(x, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    #     logits, loss = model(x, y)
+    #     optimizer.zero_grad()
+    #     loss.backward()
+    #     optimizer.step()
 
-        if epoch % config.EVAL_INTERVAL == 0:
-            estimate_loss(train_text, test_text, model)
+    #     if epoch % config.EVAL_INTERVAL == 0:
+    #         estimate_loss(train_text, test_text, model)
 
-    generated_response = decoder(model.generate(start_idx)[0].tolist())
-    print('generated_response: ', generated_response)
-        
+    # generated_response = decoder(model.generate(start_idx)[0].tolist())
+    # print('generated_response: ', generated_response)
+
+
+@app.command()
+def tril():
+    B, T, C = config.BATCH_SIZE, config.BLOCK_SIZE, config.CHANNEL_SIZE
+
+    x = torch.rand((B, T, C))
+
+    key = nn.Linear(C, config.HEAD_SIZE, bias=False)
+    query = nn.Linear(C, config.HEAD_SIZE, bias=False)
+    value = nn.Linear(C, config.HEAD_SIZE, bias=False)
+
+    k = key(x)
+    q = query(x)
+
+    wei = q @ k.transpose(-2, -1) / (config.HEAD_SIZE ** 0.5)
+
+    tril = torch.tril(torch.ones((T, T), dtype=torch.long))
+    wei = wei.masked_fill(tril == 0, float("-inf"))
+    wei = F.softmax(wei, dim=-1)
+    
+    v = value(x)
+    bow = wei @ v
+
+    print('tril: ', tril)
+    print('wei: ', wei)
+    print('bow: ', bow)
+    
 
 
 if __name__ == "__main__":
