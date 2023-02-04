@@ -1,12 +1,17 @@
-import typer
-import config
+import shutil
 from pathlib import Path
 
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import typer
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+import config
+from config import logger
 
 app = typer.Typer()
 
@@ -42,7 +47,7 @@ def get_batch(input_text):
     x = torch.stack([input_text[i : i + config.BLOCK_SIZE] for i in start])
     y = torch.stack([input_text[i + 1 : i + config.BLOCK_SIZE + 1] for i in start])
     x, y = x.to(DEVICE), y.to(DEVICE)
-    
+
     return x, y
 
 
@@ -51,18 +56,23 @@ def estimate_loss(train_text, test_text, model):
     # Estimate loss on a batch of x and y text
     model.eval()
 
-    losses = {"train": torch.zeros(config.EVAL_ITER), "test": torch.zeros(config.EVAL_ITER)}
+    losses = {
+        "train": torch.zeros(config.EVAL_ITER),
+        "test": torch.zeros(config.EVAL_ITER),
+    }
     for i in tqdm(range(config.EVAL_ITER)):
         train_x, train_y = get_batch(train_text)
         _, train_loss = model(train_x, train_y)
-        
+
         test_x, test_y = get_batch(test_text)
         _, test_loss = model(test_x, test_y)
 
         losses["train"][i] = train_loss.item()
         losses["test"][i] = test_loss.item()
 
-    print(f"Training Loss: {torch.mean(losses['train']):.4f}, Validation Loss: {torch.mean(losses['test']):.4f}")
+    logger.info(
+        f"Training Loss: {torch.mean(losses['train']):.4f}, Validation Loss: {torch.mean(losses['test']):.4f}"
+    )
     model.train()
 
 
@@ -74,7 +84,9 @@ class Head(nn.Module):
         self.query = nn.Linear(config.N_EMBED, config.HEAD_SIZE, bias=False)
         self.value = nn.Linear(config.N_EMBED, config.HEAD_SIZE, bias=False)
 
-        self.register_buffer("tril", torch.tril(torch.ones(config.BLOCK_SIZE, config.BLOCK_SIZE)))
+        self.register_buffer(
+            "tril", torch.tril(torch.ones(config.BLOCK_SIZE, config.BLOCK_SIZE))
+        )
 
         self.dropout = nn.Dropout(config.DROPOUT)
 
@@ -84,11 +96,11 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
 
-        wei = q @ k.transpose(-2, -1) / (C ** 0.5)
+        wei = q @ k.transpose(-2, -1) / (C**0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        
+
         v = self.value(x)
         bow = wei @ v
 
@@ -119,7 +131,7 @@ class FeedForward(nn.Module):
                 nn.Linear(config.N_EMBED, config.N_EMBED * 4),
                 nn.ReLU(),
                 nn.Linear(config.N_EMBED * 4, config.N_EMBED),
-                nn.Dropout(config.DROPOUT)
+                nn.Dropout(config.DROPOUT),
             ]
         )
 
@@ -174,7 +186,7 @@ class BigramModel(nn.Module):
 
     def generate(self, idx, max_tokens=100):
         for _ in tqdm(range(max_tokens)):
-            idx_cond = idx[:, -config.BLOCK_SIZE:]
+            idx_cond = idx[:, -config.BLOCK_SIZE :]
             logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
@@ -185,47 +197,117 @@ class BigramModel(nn.Module):
         return idx
 
 
+class TrainerModule(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+
+        self.model = BigramModel()
+
+    def forward(self, x, target=None):
+        return self.model(x, target)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits, loss = self(x, y)
+
+        self.log(
+            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits, loss = self(x, y)
+
+        self.log(
+            "val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
+
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=config.LR)
+        return optimizer
+
+
+class CorpusDataset(Dataset):
+    def __init__(self, text):
+        self.text = text
+
+    def __len__(self):
+        return len(self.text) - config.BLOCK_SIZE
+
+    def __getitem__(self, idx):
+        x = self.text[idx : idx + config.BLOCK_SIZE]
+        y = self.text[idx + 1 : idx + config.BLOCK_SIZE + 1]
+
+        return x, y
+
+
 @app.command()
 def train():
-    # Prepare dataset
+    # Prepare dataset and dataloader
     split = int(len(text) * config.TRAIN_TEST_SPLIT)
     train_text = torch.tensor(encoder(text[:split]), dtype=torch.long)
     test_text = torch.tensor(encoder(text[split:]), dtype=torch.long)
 
+    train_dataset = CorpusDataset(train_text)
+    test_dataset = CorpusDataset(test_text)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE)
+
     # Initialize model
-    model = BigramModel()
-    model = model.to(DEVICE)
+    model = TrainerModule()
 
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
-  
-    # Train model
-    for epoch in tqdm(range(config.EPOCHS + 1)):
-        x, y = get_batch(train_text)
+    # Initialize trainer
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=config.CHECKPOINT_DIR,
+        filename="model-{epoch:02d}-{val_loss:.2f}",
+        save_top_k=3,
+        monitor="val_loss",
+        mode="min",
+    )
 
-        logits, loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=1,
+        max_epochs=config.EPOCHS,
+        default_root_dir=config.CHECKPOINT_DIR,
+        callbacks=[
+            checkpoint_callback,
+            EarlyStopping(monitor="val_loss", patience=3, mode="min"),
+        ],
+    )
+    trainer.fit(model, train_loader, test_loader)
 
-        if epoch % config.EVAL_INTERVAL == 0:
-            estimate_loss(train_text, test_text, model)
+    logger.info("Training finished!")
+    logger.info(f"Best checkpoint: {checkpoint_callback.best_model_path}")
+    logger.info(
+        f"Copying best checkpoint to {Path(config.CHECKPOINT_DIR, 'model.ckpt')}"
+    )
 
-    # Save model
-    torch.save(model.state_dict(), Path(config.CHECKPOINT_DIR, "model.pt"))
+    shutil.copy(
+        checkpoint_callback.best_model_path, Path(config.CHECKPOINT_DIR, "model.ckpt")
+    )
 
 
 @app.command()
 def generate():
     # Load model
-    model = BigramModel()
-    model.load_state_dict(torch.load(Path(config.CHECKPOINT_DIR, "model.pt")))
+    model = TrainerModule.load_from_checkpoint(
+        Path(config.CHECKPOINT_DIR, "model.ckpt")
+    )
     model = model.to(DEVICE)
+    model.eval()
 
     # Generate text
     start_idx = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
-    generated_response = decoder(model.generate(start_idx, max_tokens=500)[0].tolist())
-    print('generated_response: ', generated_response)
+    generated_response = decoder(
+        model.model.generate(start_idx, max_tokens=500)[0].tolist()
+    )
+    logger.info("generated_response: ", generated_response)
 
 
 @app.command()
@@ -241,21 +323,19 @@ def tril():
     k = key(x)
     q = query(x)
 
-    wei = q @ k.transpose(-2, -1) / (config.HEAD_SIZE ** 0.5)
+    wei = q @ k.transpose(-2, -1) / (config.HEAD_SIZE**0.5)
 
     tril = torch.tril(torch.ones((T, T), dtype=torch.long))
     wei = wei.masked_fill(tril == 0, float("-inf"))
     wei = F.softmax(wei, dim=-1)
-    
+
     v = value(x)
     bow = wei @ v
 
-    print('tril: ', tril)
-    print('wei: ', wei)
-    print('bow: ', bow)
-    
+    logger.info("tril: ", tril)
+    logger.info("wei: ", wei)
+    logger.info("bow: ", bow)
 
 
 if __name__ == "__main__":
     app()
-
