@@ -7,21 +7,23 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.absolute()
 LOGS_DIR = Path(BASE_DIR, "logs")
 DATASET_DIR = Path(BASE_DIR, "dataset")
+CHECKPOINT_DIR = Path(BASE_DIR, "checkpoint")
 
 # Create Dirs
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Config
-BATCH_SIZE = 4 # 64
-BLOCK_SIZE = 8 # 256
-CHANNEL_SIZE = 8 # 32
+BATCH_SIZE = 64
+BLOCK_SIZE = 256
+CHANNEL_SIZE = 32
 N_EMBED = 384
 N_HEAD = 6
 N_LAYER = 6
 HEAD_SIZE = N_EMBED // N_HEAD
 DROPOUT = 0.2
 TRAIN_TEST_SPLIT = 0.9
-EPOCHS = 10000 # 5000
+EPOCHS = 5000
 EVAL_ITER = 200
 EVAL_INTERVAL = 500
 LR = 3e-4
